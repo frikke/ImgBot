@@ -5,7 +5,7 @@
   },
   {
     "slug": "whats-imgbot",
-    "title": "What is ImgBot?"
+    "title": "What is Imgbot?"
   },
   {
     "slug": "compression",
@@ -28,11 +28,19 @@
     "title": "Aggressive compression"
   },
   {
+    "slug": "compress-wiki",
+    "title": "Compress wiki"
+  },
+  {
+    "slug": "min-kb-threshold",
+    "title": "Min KB threshold"
+  },
+  {
     "slug": "authorization",
     "title": "Authorization"
   },
   {
     "slug": "contributing",
-    "title": "Contributing to ImgBot"
+    "title": "Contributing to Imgbot"
   }
 ]

@@ -53,6 +53,9 @@ export default {
   },
   computed: {
     plan: function() {
+      if (this.installation.student) {
+        return 'Student'
+      }
       switch (this.installation.planId) {
         case 781:
           return 'Early adopter plan'
@@ -60,6 +63,10 @@ export default {
           return 'Open source plan'
         case 1750:
           return 'Premium plan'
+        case 2840:
+          return 'Individual plan'
+        case 2841:
+          return 'Professional plan'
       }
     },
     changePlan: function() {
@@ -67,14 +74,20 @@ export default {
         case 1749:
           return 'Upgrade plan'
         case 1750:
+        case 2840:
+        case 2841:
           return 'Downgrade plan'
       }
     },
     changePlanLink: function() {
       switch (this.installation.planId) {
         case 1749:
-          return `https://github.com/marketplace/imgbot/upgrade/3/${this.installation.accountid}`
+          return this.installation.accounttype === 'User' ?
+            `https://github.com/marketplace/imgbot/upgrade/4/${this.installation.accountid}` :
+            `https://github.com/marketplace/imgbot/upgrade/5/${this.installation.accountid}`
         case 1750:
+        case 2840:
+        case 2841:
           return `https://github.com/marketplace/imgbot/upgrade/2/${this.installation.accountid}`
       }
     },

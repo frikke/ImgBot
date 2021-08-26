@@ -5,6 +5,7 @@ using System.Net.Http.Headers;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Auth.Extensions;
+using Common;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.WindowsAzure.Storage;
@@ -29,13 +30,7 @@ namespace Auth
             }
 
             var marketplaceTable = GetTable("marketplace");
-            var installationsRequest = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/user/installations");
-            installationsRequest.Headers.Authorization = new AuthenticationHeaderValue("token", token);
-            installationsRequest.AddGithubHeaders();
-            var installationsResponse = await HttpClient.SendAsync(installationsRequest);
-            var installationsJson = await installationsResponse.Content.ReadAsStringAsync();
-            var installationsData = JsonConvert.DeserializeObject<Model.Installations>(installationsJson);
-
+            var installationsData = await GetInstallationsData(token);
             var installations = await Task.WhenAll(installationsData.installations.Select(async x =>
             {
                 var mktplc = await marketplaceTable.ExecuteAsync(
@@ -47,8 +42,10 @@ namespace Auth
                     x.html_url,
                     x.account.login,
                     accountid = x.account.id,
+                    accounttype = x.account.type,
                     x.account.avatar_url,
-                    planId = (mktplc.Result as Common.TableModels.Marketplace)?.PlanId
+                    planId = (mktplc.Result as Common.TableModels.Marketplace)?.PlanId,
+                    student = (mktplc.Result as Common.TableModels.Marketplace)?.Student,
                 };
             }));
 
@@ -125,6 +122,49 @@ namespace Auth
             return response;
         }
 
+        [FunctionName("ListPullsFunction")]
+        public static async Task<HttpResponseMessage> ListPullsAsync(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "pulls/{login}")] HttpRequestMessage req,
+            string login)
+        {
+            var token = req.ReadCookie("token");
+            if (token == null)
+            {
+                throw new Exception("missing authentication");
+            }
+
+            var pullsTable = GetTable("pull");
+            var installationsData = await GetInstallationsData(token);
+            if (!installationsData.installations.Select(x => x.account.login).Contains(login))
+            {
+                throw new Exception("login request mismatch");
+            }
+
+            var query = new TableQuery<Common.TableModels.Pr>().Where($"PartitionKey eq '{login}'");
+            var pulls = await pullsTable.ExecuteQuerySegmentedAsync(query, null);
+            var response = req.CreateResponse();
+            response.SetJson(new
+            {
+                pulls = pulls.Results.Select(x =>
+                {
+                    return new
+                    {
+                        x.Id,
+                        x.NumImages,
+                        x.Number,
+                        x.Owner,
+                        x.PercentReduced,
+                        x.RepoName,
+                        x.SizeAfter,
+                        x.SizeBefore,
+                        x.SpaceReduced,
+                        x.Timestamp
+                    };
+                }).ToArray()
+            }).EnableCors();
+            return response;
+        }
+
         [FunctionName("RequestRepositoryCheckFunction")]
         public static async Task<HttpResponseMessage> RequestRepositoryCheckAsync(
             [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "repositories/check/{installationid}/{repositoryid}")]HttpRequestMessage req,
@@ -146,6 +186,17 @@ namespace Auth
                 throw new Exception("repository request mismatch");
             }
 
+            var response = req.CreateResponse();
+            response.EnableCors();
+
+            var imgbotBranch = await GetImgbotBranch(repository, token);
+            if (imgbotBranch != null)
+            {
+                // branch already exists
+                response.SetJson(new { status = "branchexists" });
+                return response;
+            }
+
             await routerQueue.AddMessageAsync(new CloudQueueMessage(JsonConvert.SerializeObject(new Common.Messages.RouterMessage
             {
                 CloneUrl = repository.html_url,
@@ -154,10 +205,83 @@ namespace Auth
                 RepoName = repository.name,
             })));
 
+            response.SetJson(new { status = "OK" });
+            return response;
+        }
+
+        [FunctionName("GetRepositorySettingsFunction")]
+        public static async Task<HttpResponseMessage> GetRepositorySettingsAsync(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "repositories/settings/{installationid}/{repositoryid}")]HttpRequestMessage req,
+            string installationid,
+            string repositoryid)
+        {
+            var token = req.ReadCookie("token");
+            if (token == null)
+            {
+                throw new Exception("missing authentication");
+            }
+
+            var repository = await GetRepository(installationid, token, repositoryid);
+            if (repository == null)
+            {
+                throw new Exception("repository request mismatch");
+            }
+
+            var settingsTable = GetTable("settings");
+            var settings = await Common.TableModels.SettingsHelper.GetSettings(settingsTable, installationid, repository.name);
             var response = req.CreateResponse();
-            response
-              .SetJson(new { status = "OK" })
-              .EnableCors();
+            if (settings != null)
+            {
+                response.SetJson(new
+                {
+                    settings.InstallationId,
+                    settings.RepoName,
+                    settings.DefaultBranchOverride,
+                });
+            }
+
+            response.EnableCors();
+            return response;
+        }
+
+        [FunctionName("SetRepositorySettingsFunction")]
+        public static async Task<HttpResponseMessage> SetRepositorySettingsAsync(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post", "options", Route = "repositories/settings/{installationid}/{repositoryid}")]HttpRequestMessage req,
+            string installationid,
+            string repositoryid)
+        {
+            if (req.Method == HttpMethod.Options)
+            {
+                return req.CreateOptionsResponse();
+            }
+
+            var token = req.ReadCookie("token");
+            if (token == null)
+            {
+                throw new Exception("missing authentication");
+            }
+
+            var repository = await GetRepository(installationid, token, repositoryid);
+            if (repository == null)
+            {
+                throw new Exception("repository request mismatch");
+            }
+
+            var settingsTable = GetTable("settings");
+            var settings = await Common.TableModels.SettingsHelper.GetSettings(settingsTable, installationid, repository.name);
+            if (settings == null)
+            {
+                settings = new Common.TableModels.Settings(installationid, repository.name);
+            }
+
+            var bodyJson = await req.Content.ReadAsStringAsync();
+            var newSettings = JsonConvert.DeserializeObject<Common.TableModels.Settings>(bodyJson);
+
+            settings.DefaultBranchOverride = newSettings.DefaultBranchOverride;
+
+            await settingsTable.ExecuteAsync(TableOperation.InsertOrReplace(settings));
+            var response = req.CreateResponse();
+            response.EnableCors();
             return response;
         }
 
@@ -206,6 +330,16 @@ namespace Auth
             return null;
         }
 
+        private static async Task<Model.Installations> GetInstallationsData(string token)
+        {
+            var installationsRequest = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/user/installations");
+            installationsRequest.Headers.Authorization = new AuthenticationHeaderValue("token", token);
+            installationsRequest.AddGithubHeaders();
+            var installationsResponse = await HttpClient.SendAsync(installationsRequest);
+            var installationsJson = await installationsResponse.Content.ReadAsStringAsync();
+            return JsonConvert.DeserializeObject<Model.Installations>(installationsJson);
+        }
+
         private static async Task<Model.Repository> GetRepository(string installationid, string token, string repositoryid)
         {
             Model.Repository repository = null;
@@ -231,6 +365,30 @@ namespace Auth
             while (repository == null && next != null);
 
             return repository;
+        }
+
+        private static async Task<Model.Branch> GetImgbotBranch(Model.Repository repository, string token)
+        {
+            Model.Branch imgbotBranch = null;
+
+            try
+            {
+                var imgbotBranchRequest = new HttpRequestMessage(HttpMethod.Get, repository.branches_url.Replace("{/branch}", $"/{KnownGitHubs.BranchName}"));
+                imgbotBranchRequest.Headers.Authorization = new AuthenticationHeaderValue("token", token);
+                imgbotBranchRequest.AddGithubHeaders();
+                var imgbotBranchResponse = await HttpClient.SendAsync(imgbotBranchRequest);
+                var imbotBranchJson = await imgbotBranchResponse.Content.ReadAsStringAsync();
+                imgbotBranch = JsonConvert.DeserializeObject<Model.Branch>(imbotBranchJson);
+                if (imgbotBranch.name != KnownGitHubs.BranchName)
+                {
+                    return null;
+                }
+            }
+            catch
+            {
+            }
+
+            return imgbotBranch;
         }
     }
 }

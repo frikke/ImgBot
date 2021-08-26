@@ -30,8 +30,17 @@ namespace WebHook
             var deleteBranchMessages = storageAccount.CreateCloudQueueClient().GetQueueReference("deletebranchmessage");
             var installationTable = storageAccount.CreateCloudTableClient().GetTableReference("installation");
             var marketplaceTable = storageAccount.CreateCloudTableClient().GetTableReference("marketplace");
+            var settingsTable = storageAccount.CreateCloudTableClient().GetTableReference("settings");
 
-            return Run(req, routerQueue, openPrQueue, deleteBranchMessages, installationTable, marketplaceTable, logger);
+            return Run(
+                req,
+                routerQueue,
+                openPrQueue,
+                deleteBranchMessages,
+                installationTable,
+                marketplaceTable,
+                settingsTable,
+                logger);
         }
 
         public static async Task<IActionResult> Run(
@@ -41,6 +50,7 @@ namespace WebHook
             CloudQueue deleteBranchMessages,
             CloudTable installationTable,
             CloudTable marketplaceTable,
+            CloudTable settingsTable,
             ILogger logger)
         {
             var hookEvent = req.Headers.GetValues("X-GitHub-Event").First();
@@ -53,7 +63,8 @@ namespace WebHook
                     result = await ProcessInstallationAsync(hook, marketplaceTable, routerMessages, installationTable, logger).ConfigureAwait(false);
                     break;
                 case "push":
-                    result = await ProcessPushAsync(hook, marketplaceTable, routerMessages, openPrMessages, deleteBranchMessages, logger).ConfigureAwait(false);
+                    result = await ProcessPushAsync(hook, marketplaceTable, settingsTable, routerMessages, openPrMessages, deleteBranchMessages, logger)
+                                    .ConfigureAwait(false);
                     break;
                 case "marketplace_purchase":
                     result = await ProcessMarketplacePurchaseAsync(hook, marketplaceTable, logger).ConfigureAwait(false);
@@ -66,6 +77,7 @@ namespace WebHook
         private static async Task<string> ProcessPushAsync(
             Hook hook,
             CloudTable marketplaceTable,
+            CloudTable settingsTable,
             CloudQueue routerMessages,
             CloudQueue openPrMessages,
             CloudQueue deleteBranchMessages,
@@ -90,6 +102,7 @@ namespace WebHook
                     InstallationId = hook.installation.id,
                     RepoName = hook.repository.name,
                     CloneUrl = $"https://github.com/{hook.repository.full_name}",
+                    Update = false,
                 })));
 
                 logger.LogInformation("ProcessPush: Added OpenPrMessage for {Owner}/{RepoName}", hook.repository.owner.login, hook.repository.name);
@@ -97,14 +110,26 @@ namespace WebHook
                 return "imgbot push";
             }
 
-            // push to non-default branch
-            if (hook.@ref != $"refs/heads/{hook.repository.default_branch}")
+            var repositorySettings = await SettingsHelper.GetSettings(settingsTable, hook.installation.id, hook.repository.name);
+            var branchToCheck = hook.repository.default_branch;
+            if (repositorySettings != null && !string.IsNullOrEmpty(repositorySettings.DefaultBranchOverride))
             {
-                return "Commit to non default branch";
+                logger.LogInformation(
+                    "ProcessPush: default branch override for {Owner}/{RepoName} is {DefaultBranchOverride}",
+                    hook.repository.owner.login,
+                    hook.repository.name,
+                    repositorySettings.DefaultBranchOverride);
+                branchToCheck = repositorySettings.DefaultBranchOverride;
+            }
+
+            // push to non-default branch
+            if (hook.@ref != $"refs/heads/{branchToCheck}")
+            {
+                return "Commit to non default branch (or override)";
             }
 
             // merge commit to default branch from imgbot branch
-            if (IsDefaultWebMerge(hook))
+            if (IsDefaultWebMerge(hook, branchToCheck))
             {
                 await deleteBranchMessages.AddMessageAsync(new CloudQueueMessage(JsonConvert.SerializeObject(new DeleteBranchMessage
                 {
@@ -219,17 +244,19 @@ namespace WebHook
                     await marketplaceTable.ExecuteAsync(TableOperation.InsertOrMerge(new Marketplace(hook.marketplace_purchase.account.id, hook.marketplace_purchase.account.login)
                     {
                         AccountType = hook.marketplace_purchase.account.type,
+                        SenderEmail = hook.sender.email,
+                        OrganizationBillingEmail = hook.marketplace_purchase.account.organization_billing_email,
                         PlanId = hook.marketplace_purchase.plan.id,
                         SenderId = hook.sender.id,
                         SenderLogin = hook.sender.login,
                     }));
 
-                    logger.LogInformation("ProcessMarketplacePurchaseAsync/purchased for {Owner}", hook.marketplace_purchase.account.login);
+                    logger.LogInformation("ProcessMarketplacePurchaseAsync/purchased {PlanId} for {Owner}", hook.marketplace_purchase.plan.id, hook.marketplace_purchase.account.login);
 
                     return hook.action;
                 case "cancelled":
                     await marketplaceTable.DropRow(hook.marketplace_purchase.account.id, hook.marketplace_purchase.account.login);
-                    logger.LogInformation("ProcessMarketplacePurchaseAsync/cancelled for {Owner}", hook.marketplace_purchase.account.login);
+                    logger.LogInformation("ProcessMarketplacePurchaseAsync/cancelled {PlanId} for {Owner}", hook.marketplace_purchase.plan.id, hook.marketplace_purchase.account.login);
                     return "cancelled";
                 default:
                     return hook.action;
@@ -239,7 +266,7 @@ namespace WebHook
         private static async Task<bool> IsPrivateEligible(CloudTable marketplaceTable, string ownerLogin)
         {
             var query = new TableQuery<Marketplace>().Where(
-                    $"AccountLogin eq '{ownerLogin}' and (PlanId eq 1750 or PlanId eq 781)");
+                    $"AccountLogin eq '{ownerLogin}' and (PlanId eq 2841 or PlanId eq 2840 or PlanId eq 1750 or PlanId eq 781 or Student eq true)");
             var rows = await marketplaceTable.ExecuteQuerySegmentedAsync(query, null);
             return rows.Count() != 0;
         }
@@ -248,9 +275,9 @@ namespace WebHook
         // 1. should be merged using the web gui on github.com
         // 2. should be merging into the default branch from the imgbot branch
         // 3. should only contain the merge commit and the imgbot commit to be eligible
-        private static bool IsDefaultWebMerge(Hook hook)
+        private static bool IsDefaultWebMerge(Hook hook, string branchToCheck)
         {
-            if (hook.@ref != $"refs/heads/{hook.repository.default_branch}")
+            if (hook.@ref != $"refs/heads/{branchToCheck}")
                 return false;
 
             if (hook.commits?.Count == 1)

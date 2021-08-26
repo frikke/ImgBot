@@ -1,7 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Threading.Tasks;
 using Common;
 using Common.Messages;
@@ -9,8 +7,8 @@ using Common.TableModels;
 using Install;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Internal;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Microsoft.WindowsAzure.Storage.Table;
 using NSubstitute;
 using OpenPrFunction;
 
@@ -81,7 +79,7 @@ namespace Test
             }
         }
 
-        private Task ExecuteRunAsync(int installationId, string owner, string repoName, long prId,  out ILogger logger)
+        private Task ExecuteRunAsync(int installationId, string owner, string repoName, long prId, out ILogger logger)
         {
             var cloneUrl = $"https://github.com/{owner}/{repoName}";
 
@@ -122,9 +120,13 @@ namespace Test
                  }));
 
             var pullRequest = Substitute.For<IPullRequest>();
-            pullRequest.OpenAsync(Arg.Any<GitHubClientParameters>()).Returns(x => Task.FromResult(prId));
+            pullRequest.OpenAsync(Arg.Any<GitHubClientParameters>(), false).Returns(x => Task.FromResult(new Pr(installation.Owner) { Id = prId }));
 
-            return OpenPr.RunAsync(openPrMessage, installation, installationTokenProvider, pullRequest, logger, context);
+            var settingsTable = Substitute.For<CloudTable>(new Uri("https://myaccount.table.core.windows.net/Tables/settings"));
+
+            var prs = Substitute.For<ICollector<Pr>>();
+
+            return OpenPr.RunAsync(openPrMessage, installation, prs, settingsTable, installationTokenProvider, pullRequest, logger, context);
         }
     }
 }
